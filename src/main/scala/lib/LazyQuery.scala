@@ -1,9 +1,10 @@
 package lib
 
-import cats.syntax.applicative.*
-import cats.{Applicative, Monad, MonadError, StackSafeMonad, ~>, Defer as CatsDefer}
+import cats.syntax.applicative._
+import cats.{Applicative, Defer => CatsDefer, MonadError, StackSafeMonad, ~>}
 
 import scala.annotation.tailrec
+import scala.util.control.NonFatal
 
 /** Monad for synchronous database access that abstracts over a  `db.withSession { session => ??? }`
   * or  `db.withTransaction { tx => ??? }` connection lender pattern.
@@ -19,97 +20,123 @@ import scala.annotation.tailrec
   * @tparam A the result type
   */
 sealed trait LazyQuery[+A] {
-	import LazyQuery._
+	import LazyQuery.*
+
+	def flatMap[B](f: A => LazyQuery[B]): LazyQuery[B] = FlatMap(this, f)
+	def map[B](f: A => B): LazyQuery[B] = FlatMap(this, a => Done(f(a)))
+	def withSideEffect(f: (A, Option[DbTransaction]) => Unit): LazyQuery[A] = flatMap { a => SideEffect(f(a, _)).map(_ => a) }
+	def handleError[B >: A](f: Throwable => B): LazyQuery[B] = MonadError[LazyQuery, Throwable].handleError(this)(f)
+	def handleErrorWith[B >: A](f: Throwable => LazyQuery[B]): LazyQuery[B] = MonadError[LazyQuery, Throwable].handleErrorWith(this)(f)
+	def transactional(label: String): LazyQuery[A] = WithTransaction(label, _ => this)
+
+	final def runStateless(db: DB): A = advance(this, PendingDb(db))
+	final def runWithSession(s: DbSession): A = advance(this, InSession(s))
+	final def runWithTransaction(tx: DbTransaction): A = advance(this, InTransaction(tx))
+}
+
+object LazyQuery {
+
+	def pure[A](a: A): LazyQuery[A] = Done(a)
+	def defer[A](fa: => LazyQuery[A]): LazyQuery[A] = Defer(() => fa)
+	def delay[A](a: => A): LazyQuery[A] = Defer(() => Done(a))
+	def read[A](label: String)(op: DbSession => A): LazyQuery[A] = WithSession(label, s => Done(op(s)))
+	def write[A](label: String)(op: DbTransaction => A): LazyQuery[A] = WithTransaction(label, tx => Done(op(tx)))
+	def raiseError(err: Throwable): LazyQuery[Nothing] = Defer(() => throw err)
+
+	def bind[F[_] : CatsDefer : Applicative](db: DB): LazyQuery ~> F = new (LazyQuery ~> F) {
+		def apply[A](fa: LazyQuery[A]): F[A] = CatsDefer[F].defer {
+			advance(fa, PendingDb(db)).pure[F]
+		}
+	}
 
 	/* Implementation note:
-	 * The Done/Call/Cont classes are essentially a copy of scala.util.control.TailCalls,
+	 * The Done/Defer/FlatMap classes are essentially a copy of scala.util.control.TailCalls's `Done/Call/Cont` classes, 
 	 * with the goal of stack-safety in the `flatMap` and `tailRecM` monad methods.
 	 * Read and Write are like Call, but act as a gate that prompts the runner to open
 	 * a session or transaction if one isn't currently in use.
 	 */
+	
+	private case class Done[A](result: A) extends LazyQuery[A]
+	private case class Defer[A](f: () => LazyQuery[A]) extends LazyQuery[A]
+	private case class WithSession[A](label: String, f: DbSession => LazyQuery[A]) extends LazyQuery[A]
+	private case class WithTransaction[A](label: String, f: DbTransaction => LazyQuery[A]) extends LazyQuery[A]
+	private case class SideEffect(f: Option[DbTransaction] => Unit) extends LazyQuery[Unit]
+	private case class Recovery[A](inner: LazyQuery[A], recover: Throwable => LazyQuery[A]) extends LazyQuery[A]
+	private case class FlatMap[X, A](prev: LazyQuery[X], next: X => LazyQuery[A]) extends LazyQuery[A]
 
-	@tailrec final def runStateless(db: DB): A = this match {
-		case Done(a) => a
-		case Call(op) => op().runStateless(db)
-		case Read(label, op) => db.withSession(label) { s => op(s).runWithSession(s) }
-		case Write(label, op) => db.withTransaction(label) { tx => op(tx).runWithTransaction(tx) }
-		case Cont(fa, f) => fa match {
-			case Done(a) => f(a).runStateless(db)
-			case Call(op) => op().flatMap(f).runStateless(db)
-			case Read(label, op) => db.withSession(label) { s => op(s).flatMap(f).runWithSession(s) }
-			case Write(label, op) => db.withTransaction(label) { tx => op(tx).flatMap(f).runWithTransaction(tx) }
-			case Cont(fb, g) => fb.flatMap(b => g(b).flatMap(f)).runStateless(db)
-		}
-	}
-
-	@tailrec final def runWithSession(s: DbSession): A = this match {
-		case Done(a) => a
-		case Call(op) => op().runWithSession(s)
-		case Read(label, op) => op(s).runWithSession(s)
-		case Write(label, op) => s.withTransaction { tx => op(tx).runWithTransaction(tx) }
-		case Cont(fx, f) => fx match {
-			case Done(x) => f(x).runWithSession(s)
-			case Call(op) => op().flatMap(f).runWithSession(s)
-			case Read(_, op) => op(s).flatMap(f).runWithSession(s)
-			case Write(_, op) => s.withTransaction { tx => op(tx).flatMap(f).runWithTransaction(tx) }
-			case Cont(fy, g) => fy.flatMap(y => g(y).flatMap(f)).runWithSession(s)
-		}
-	}
-
-	@tailrec final def runWithTransaction(tx: DbTransaction): A = this match {
-		case Done(a) => a
-		case Call(op) => op().runWithTransaction(tx)
-		case Read(_, op) => op(tx).runWithTransaction(tx)
-		case Write(_, op) => op(tx).runWithTransaction(tx)
-		case Cont(fx, f) => fx match {
-			case Done(x) => f(x).runWithTransaction(tx)
-			case Call(op) => op().flatMap(f).runWithTransaction(tx)
-			case Read(_, op) => op(tx).flatMap(f).runWithTransaction(tx)
-			case Write(_, op) => op(tx).flatMap(f).runWithTransaction(tx)
-			case Cont(fy, g) => fy.flatMap(y => g(y).flatMap(f)).runWithTransaction(tx)
-		}
-	}
-
-	def map[B](f: A => B): LazyQuery[B] = Monad[LazyQuery].map(this)(f)
-
-	def flatMap[B](f: A => LazyQuery[B]): LazyQuery[B] = this match {
-		case Done(a) => Call(() => f(a))
-		case c@Call(_) => Cont(c, f)
-		case Read(label, op) => Read(label, s => op(s).flatMap(f))
-		case Write(label, op) => Write(label, tx => op(tx).flatMap(f))
-		// copying the special sauce from scala.util.control.TailCalls
-		case c: Cont[a1, b1] => Cont(c.a, (x: a1) => c.f(x).flatMap(f))
-	}
-}
-
-object LazyQuery {
-	def pure[A](a: A): LazyQuery[A] = Done(a)
-	def defer[A](fa: => LazyQuery[A]): LazyQuery[A] = Call(() => fa)
-	def delay[A](a: => A): LazyQuery[A] = Call(() => Done(a))
-	def read[A](label: String)(op: DbSession => A): LazyQuery[A] = Read(label, s => Done(op(s)))
-	def write[A](label: String)(op: DbTransaction => A): LazyQuery[A] = Write(label, tx => Done(op(tx)))
-
-	def bind[F[_] : CatsDefer : Applicative](db: DB): LazyQuery ~> F = new (LazyQuery ~> F) {
-		def apply[A](fa: LazyQuery[A]): F[A] = CatsDefer[F].defer {
-			fa.runStateless(db).pure[F]
-		}
-	}
-
-	private case class Done[A](value: A) extends LazyQuery[A]
-	private case class Call[A](rest: () => LazyQuery[A]) extends LazyQuery[A]
-	private case class Read[A](label: String, op: DbSession => LazyQuery[A]) extends LazyQuery[A]
-	private case class Write[A](label: String, op: DbTransaction => LazyQuery[A]) extends LazyQuery[A]
-	private case class Cont[X, A](a: LazyQuery[X], f: X => LazyQuery[A]) extends LazyQuery[A] {
-		override def flatMap[B](g: A => LazyQuery[B]) = Cont[X, B](a, f(_).flatMap(g))
-	}
-
-	implicit val catsMonadForLazyQuery: Monad[LazyQuery] = new StackSafeMonad[LazyQuery] {
+	implicit val catsMonadForLazyQuery: MonadError[LazyQuery, Throwable] = new MonadError[LazyQuery, Throwable] with StackSafeMonad[LazyQuery] {
 		def pure[A](x: A): LazyQuery[A] = Done(x)
-
 		def flatMap[A, B](fa: LazyQuery[A])(f: A => LazyQuery[B]): LazyQuery[B] = fa.flatMap(f)
+		def raiseError[A](e: Throwable): LazyQuery[A] = Defer { () => throw e }
+		def handleErrorWith[A](fa: LazyQuery[A])(f: Throwable => LazyQuery[A]): LazyQuery[A] = Recovery(fa, f)
 	}
 
 	implicit val catsDeferForLazyQuery: CatsDefer[LazyQuery] = new CatsDefer[LazyQuery] {
-		def defer[A](fa: => LazyQuery[A]): LazyQuery[A] = Call(() => fa)
+		def defer[A](fa: => LazyQuery[A]): LazyQuery[A] = Defer(() => fa)
+	}
+
+	// states
+	private sealed trait RunState
+	private case class PendingDb(db: DB) extends RunState {
+		def startSession[A](step: WithSession[A]): A =
+			db.withSession(step.label) { s => advance(step.f(s), InSession(s)) }
+		def startTransaction[A](step: WithTransaction[A]): A =
+			db.withTransaction(step.label) { tx => advance(step.f(tx), InTransaction(tx)) }
+	}
+	private case class InSession(s: DbSession) extends RunState {
+		def upgradeToTransaction[A](step: WithTransaction[A]): A =
+			s.withTransaction { tx => advance(step.f(tx), InTransaction(tx)) }
+	}
+	private case class InTransaction(tx: DbTransaction) extends RunState
+
+	@tailrec private def advance[A](step: LazyQuery[A], state: RunState): A = step match {
+		case Done(result) => result
+		case Defer(f) => advance(f(), state)
+		case step@WithSession(label, f) => state match {
+			case pending: PendingDb => pending.startSession(step)
+			case InSession(s) => advance(f(s), state)
+			case InTransaction(tx) => advance(f(tx), state)
+		}
+		case step@WithTransaction(label, f) => state match {
+			case pending: PendingDb => pending.startTransaction(step)
+			case inSession: InSession => inSession.upgradeToTransaction(step)
+			case InTransaction(tx) => advance(f(tx), state)
+		}
+		case Recovery(inner, recover) => runRecovery(inner, recover, state)
+		case SideEffect(f) => state match {
+			case InTransaction(tx) => f(Some(tx))
+			case _ => f(None)
+		}
+		case FlatMap(prev, f) => prev match {
+			case Done(x) => advance(f(x), state)
+			case Defer(x) => advance(x().flatMap(f), state)
+			case WithSession(label, a) => advance(WithSession(label, a(_).flatMap(f)), state)
+			case WithTransaction(label, a) => advance(WithTransaction(label, a(_).flatMap(f)), state)
+			case Recovery(x, r) => advance(Recovery(x.flatMap(f), r(_).flatMap(f)), state)
+			case SideEffect(e) =>
+				state match {
+					case InTransaction(tx) => e(Some(tx))
+					case _ => e(None)
+				}
+				advance(f(()), state)
+			case FlatMap(py, g) => advance(py.flatMap(y => g(y).flatMap(f)), state)
+		}
+	}
+
+	private def runRecovery[A](inner: LazyQuery[A], recover: Throwable => LazyQuery[A], state: RunState): A = {
+		/* If the `inner` LQ would start a new session before throwing an exception,
+		 * that session should end, and we resume execution without that session.
+		 * Similar, for transactions, where the exception would bubble up through
+		 * the transaction, causing it to roll back, and we would have to continue
+		 * from the original state instead of an `InTransaction` state.
+		 * 
+		 * If the `inner` LQ does not start any new session or transaction before throwing,
+		 * then the state is unchanged anyway.
+		 *
+		 * Therefore, there's no need to capture the new state after running `inner`.
+		 * We can simply pass the original state to `advance` in all cases.
+		 */
+		try advance(inner, state)
+		catch {case NonFatal(e) => advance(recover(e), state)}
 	}
 }
